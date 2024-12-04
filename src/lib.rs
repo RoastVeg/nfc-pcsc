@@ -1,11 +1,25 @@
 // use std::ffi::{CStr, CString};
 
 use pcsc::{
-    Card, Context, Error, Protocols, ReaderState, Scope, ShareMode, State, PNP_NOTIFICATION,
+    Card, Context, Error as PcscError, Protocols, ReaderState, Scope, ShareMode, State,
+    PNP_NOTIFICATION,
 };
+use thiserror::Error;
 
 // const ACR_122_NAME: &CStr = c"acr122";
 // const ACR_125_NAME: &CStr = c"acr125";
+
+#[derive(Debug, Error)]
+pub enum PcscCodecError {
+    #[error("PC/SC error")]
+    Pcsc(#[source] PcscError),
+    #[error("Not enough bytes")]
+    TooShort,
+    #[error("Byte length exceeded")]
+    TooLong,
+    #[error("Not a PC/SC storage card command")]
+    WrongClass,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum TagType {
@@ -14,11 +28,10 @@ pub enum TagType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(u8)]
-enum KeyType {
-    Unknown,
-    MifareA = 0x60,
-    MifareB = 0x61,
+pub enum KeyType {
+    Unknown(u8),
+    MifareA,
+    MifareB,
 }
 
 impl From<u8> for KeyType {
@@ -26,7 +39,17 @@ impl From<u8> for KeyType {
         match value {
             0x60 => KeyType::MifareA,
             0x61 => KeyType::MifareB,
-            _ => KeyType::Unknown,
+            o => KeyType::Unknown(o),
+        }
+    }
+}
+
+impl From<KeyType> for u8 {
+    fn from(value: KeyType) -> Self {
+        match value {
+            KeyType::Unknown(o) => o,
+            KeyType::MifareA => 0x60,
+            KeyType::MifareB => 0x61,
         }
     }
 }
@@ -41,14 +64,13 @@ impl RfidTag {
         self.tag_type
     }
 
-    pub fn run_command(&self, command: PcscCommand) -> Result<PcscResponse, Error> {
-        let command_bytes: Vec<u8> = command.into();
+    pub fn run_command(&self, command: PcscCommand) -> Result<PcscResponse, PcscCodecError> {
+        let command_bytes: Vec<u8> = command.try_into()?;
         let mut buf = [0u8; PcscResponse::MAX_LENGTH];
-        self.card.transmit(&command_bytes, &mut buf)?;
-        if u16::from_be_bytes(buf[0..2].try_into().unwrap()) != 9000 {
-            // bail
-        }
-        let response = PcscResponse::try_from(&buf[2..]).unwrap();
+        self.card
+            .transmit(&command_bytes, &mut buf)
+            .map_err(PcscCodecError::Pcsc)?;
+        let response = PcscResponse::try_from(&buf[..])?;
         Ok(response)
     }
 }
@@ -60,9 +82,9 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn get_card(&mut self) -> Result<Option<RfidTag>, Error> {
+    pub fn get_card(&mut self) -> Result<Option<RfidTag>, PcscError> {
         if !self.is_alive {
-            return Err(Error::ReaderUnavailable);
+            return Err(PcscError::ReaderUnavailable);
         }
         self.context.get_status_change(None, &mut self.state)?;
         let event = self.state[0].event_state();
@@ -101,12 +123,12 @@ pub struct Pcsc {
 }
 
 impl Pcsc {
-    pub fn new() -> Result<Self, Error> {
+    pub fn new() -> Result<Self, PcscError> {
         let context = Context::establish(Scope::System)?;
         Ok(Self { context })
     }
 
-    pub fn get_readers(&mut self) -> Result<Vec<Reader>, Error> {
+    pub fn get_readers(&mut self) -> Result<Vec<Reader>, PcscError> {
         let mut reader_state = vec![ReaderState::new(PNP_NOTIFICATION(), State::UNAWARE)];
         self.context.get_status_change(None, &mut reader_state)?;
         // Ignore readers marked as removed
@@ -135,14 +157,13 @@ impl Pcsc {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum PcscInstruction {
+pub enum PcscInstruction {
     GetData {
         le: u8,
     },
     LoadKeys {
         data: Vec<u8>,
     },
-    // Authenticate = 0x88,
     GeneralAuthenticate {
         address: u16,
         key_type: KeyType,
@@ -168,7 +189,11 @@ pub struct PcscCommand {
 
 impl PcscCommand {
     const MIN_LENGTH: usize = 5; // class + ins + p1 + p2 + le/lc
-                                 // const MAX_LENGTH: usize = 5 + u8::MAX as usize;
+    const MAX_LENGTH: usize = 5 + u8::MAX as usize;
+
+    pub fn new(ins: PcscInstruction, p1: u8, p2: u8) -> Self {
+        Self { ins, p1, p2 }
+    }
 
     pub fn ins_code(&self) -> u8 {
         match self.ins {
@@ -183,14 +208,17 @@ impl PcscCommand {
 }
 
 impl TryFrom<&[u8]> for PcscCommand {
-    type Error = std::io::Error;
+    type Error = PcscCodecError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() < Self::MIN_LENGTH {
-            // bail
+            return Err(PcscCodecError::TooShort);
+        }
+        if value.len() > Self::MAX_LENGTH {
+            return Err(PcscCodecError::TooLong);
         }
         if value[0] != 0xFF {
-            // bail
+            return Err(PcscCodecError::WrongClass);
         }
         let p1 = value[2];
         let p2 = value[3];
@@ -221,10 +249,12 @@ impl TryFrom<&[u8]> for PcscCommand {
     }
 }
 
-impl From<PcscCommand> for Vec<u8> {
-    fn from(value: PcscCommand) -> Self {
+impl TryFrom<PcscCommand> for Vec<u8> {
+    type Error = PcscCodecError;
+
+    fn try_from(value: PcscCommand) -> Result<Self, Self::Error> {
         let ins = value.ins_code();
-        match value.ins {
+        Ok(match value.ins {
             PcscInstruction::GetData { le } | PcscInstruction::ReadBinary { le } => {
                 vec![0xFF, ins, value.p1, value.p2, le]
             }
@@ -247,34 +277,29 @@ impl From<PcscCommand> for Vec<u8> {
                     0x86,
                     value.p1,
                     value.p2,
-                    5, // Lc
+                    5, // Lc fixed
                     1, // version 1
                     addr_msb,
                     addr_lsb,
-                    key_type as u8,
+                    key_type.into(),
                     key_id,
                 ]
             }
-        }
+        })
     }
 }
 
-// enum PcscErrorCode {
-
-// }
-
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(u8)]
 pub enum PcscErrorCode {
-    Warning(u8) = 0x62,
-    AllowedRetries(u8) = 0x63,
-    MemoryFailure(u8) = 0x65,
-    WrongLength = 0x67,
-    WrongClassByte = 0x68,
-    CommandImpossible(u8) = 0x69,
-    CommandError(u8) = 0x6A,
-    WrongParameter = 0x6B,
-    WrongLengthLe(u8) = 0x6C,
+    Warning(u8),
+    AllowedRetries(u8),
+    MemoryFailure(u8),
+    WrongLength,
+    WrongClassByte,
+    CommandImpossible(u8),
+    CommandError(u8),
+    WrongParameter,
+    WrongLengthLe(u8),
 }
 
 pub enum PcscErrorCodeInfo {
@@ -382,11 +407,11 @@ impl PcscResponse {
 }
 
 impl TryFrom<&[u8]> for PcscResponse {
-    type Error = std::io::Error;
+    type Error = PcscCodecError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         let (data, eod) = match value.len() {
-            0 | 1 => todo!(),
+            0 | 1 => return Err(PcscCodecError::TooShort),
             Self::MIN_LENGTH => (vec![], 0),
             len => (value[0..len - 2].to_vec(), len - 2),
         };
@@ -438,32 +463,32 @@ mod tests {
         [0xff, 0xca, 0x00, 0x00, 0x00]
     }
 
-    fn load_authentication_keys(key_number: u8, key: [u8; 6]) -> [u8; 11] {
-        [
-            0xff, 0x82, 0x00, key_number, 0x06, key[0], key[1], key[2], key[3], key[4], key[5],
-        ]
-    }
+    // fn load_authentication_keys(key_number: u8, key: [u8; 6]) -> [u8; 11] {
+    //     [
+    //         0xff, 0x82, 0x00, key_number, 0x06, key[0], key[1], key[2], key[3], key[4], key[5],
+    //     ]
+    // }
 
-    fn authentication(block_number: u8, key_type: KeyType, key_number: u8) -> [u8; 10] {
-        [
-            // Class
-            0xff,
-            // INS (authentication)
-            0x86,
-            // P1
-            0x00,
-            // P2
-            0x00,
-            // Lc
-            0x05,
-            // Version
-            0x01,
-            0x00,
-            block_number,
-            key_type as u8,
-            key_number,
-        ]
-    }
+    // fn authentication(block_number: u8, key_type: KeyType, key_number: u8) -> [u8; 10] {
+    //     [
+    //         // Class
+    //         0xff,
+    //         // INS (authentication)
+    //         0x86,
+    //         // P1
+    //         0x00,
+    //         // P2
+    //         0x00,
+    //         // Lc
+    //         0x05,
+    //         // Version
+    //         0x01,
+    //         0x00,
+    //         block_number,
+    //         key_type as u8,
+    //         key_number,
+    //     ]
+    // }
 
     #[test]
     fn test_get_data_from_u8() {
@@ -485,7 +510,7 @@ mod tests {
             p1: 0,
             p2: 0,
         };
-        let bytes: Vec<u8> = input.into();
+        let bytes: Vec<u8> = input.try_into().unwrap();
         assert_eq!(bytes, expected);
     }
 }
