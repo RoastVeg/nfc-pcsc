@@ -11,6 +11,10 @@ pub enum PcscCodecError {
     TooLong,
     #[error("Not a PC/SC storage card command")]
     WrongClass,
+    #[error("Unknown PC/SC command")]
+    UnknownIns,
+    #[error("General Authenticate Version not supported")]
+    UnknownGeneralAuthenticateVersion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -124,26 +128,55 @@ impl TryFrom<&[u8]> for PcscCommand {
         let p2 = value[3];
         let ins = match value[1] {
             0xCA => PcscInstruction::GetData { le: value[4] },
-            // TODO: check length
-            0x82 => PcscInstruction::LoadKeys {
-                data: value[5..].to_vec(),
-            },
-            // TODO: check length, version
-            0x86 => PcscInstruction::GeneralAuthenticate {
-                address: u16::from_be_bytes([value[6], value[7]]),
-                key_type: KeyType::from(value[8]),
-                key_id: value[9],
-            },
-            // TODO: check length
-            0x20 => PcscInstruction::Verify {
-                data: value[5..].to_vec(),
-            },
+            0x82 => {
+                let lc = value[4];
+                let eod = 5 + (lc as usize);
+                if value.len() < eod {
+                    return Err(PcscCodecError::TooShort);
+                }
+                PcscInstruction::LoadKeys {
+                    data: value[5..eod].to_vec(),
+                }
+            }
+            0x86 => {
+                let lc = value[4];
+                if lc < 5 || value.len() < 10 {
+                    return Err(PcscCodecError::TooShort);
+                }
+                if lc > 5 {
+                    return Err(PcscCodecError::TooLong);
+                }
+                if value[5] != 0x01 {
+                    return Err(PcscCodecError::UnknownGeneralAuthenticateVersion);
+                }
+                PcscInstruction::GeneralAuthenticate {
+                    address: u16::from_be_bytes([value[6], value[7]]),
+                    key_type: KeyType::from(value[8]),
+                    key_id: value[9],
+                }
+            }
+            0x20 => {
+                let lc = value[4];
+                let eod = 5 + (lc as usize);
+                if value.len() < eod {
+                    return Err(PcscCodecError::TooShort);
+                }
+                PcscInstruction::Verify {
+                    data: value[5..eod].to_vec(),
+                }
+            }
             0xB0 => PcscInstruction::ReadBinary { le: value[4] },
-            // TODO: check length
-            0xD6 => PcscInstruction::UpdateBinary {
-                data: value[5..].to_vec(),
-            },
-            _ => todo!(),
+            0xD6 => {
+                let lc = value[4];
+                let eod = 5 + (lc as usize);
+                if value.len() < eod {
+                    return Err(PcscCodecError::TooShort);
+                }
+                PcscInstruction::UpdateBinary {
+                    data: value[5..eod].to_vec(),
+                }
+            }
+            _ => return Err(PcscCodecError::UnknownIns),
         };
         Ok(Self { ins, p1, p2 })
     }
