@@ -1,36 +1,52 @@
-mod command;
-pub use command::*;
+//#![deny(missing_docs)]
+
+//! `nfc-pcsc` - an implementation of the PC/SC workgroup ISO14443 and ISO15693 part 3 spec
+
+pub mod atr;
+pub mod command;
+
+use atr::{CardName, Standard, TagType};
+use command::{PcscCodecError, PcscCommand, PcscResponse};
 
 use pcsc::{
     Card, Context, Error as PcscError, Protocols, ReaderState, Scope, ShareMode, State,
     PNP_NOTIFICATION,
 };
 
-#[derive(Debug, Clone, Copy)]
-pub enum TagType {
-    StorageCard,
-    Unknown,
-}
-
 pub struct RfidTag {
-    tag_type: TagType,
+    tag_type: Option<TagType>,
+    standard: Option<Standard>,
+    card_name: Option<CardName>,
     card: Card,
 }
 
 impl RfidTag {
-    pub fn tag_type(&self) -> TagType {
+    pub fn tag_type(&self) -> Option<TagType> {
         self.tag_type
+    }
+
+    pub fn standard(&self) -> Option<Standard> {
+        self.standard
+    }
+
+    pub fn card_name(&self) -> Option<CardName> {
+        self.card_name
     }
 
     pub fn run_command(&self, command: PcscCommand) -> Result<PcscResponse, PcscCodecError> {
         let response_size = command.expected_response_len();
         let command_bytes: Vec<u8> = command.try_into()?;
-        let mut buf = Vec::with_capacity(response_size);
-        self.card
-            .transmit(&command_bytes, &mut buf)
+        let response_bytes = self
+            .send_apdu(&command_bytes, response_size)
             .map_err(PcscCodecError::Pcsc)?;
-        let response = PcscResponse::try_from(&buf[..])?;
+        let response = PcscResponse::try_from(&response_bytes[..])?;
         Ok(response)
+    }
+
+    pub fn send_apdu(&self, apdu: &[u8], response_size: usize) -> Result<Vec<u8>, PcscError> {
+        let mut buf = Vec::with_capacity(response_size);
+        self.card.transmit(apdu, &mut buf)?;
+        Ok(buf)
     }
 }
 
@@ -57,11 +73,13 @@ impl Reader {
                     ShareMode::Shared,
                     Protocols::ANY,
                 )?;
-                let tag_type = match self.state[0].atr().get(0..5) {
-                    Some([0x3B, _, 0x80, 0x01, 0x80, 0x4f]) => TagType::StorageCard,
-                    _ => TagType::Unknown,
-                };
-                Some(RfidTag { tag_type, card })
+                let (tag_type, standard, card_name) = atr::parse_atr(self.state[0].atr());
+                Some(RfidTag {
+                    tag_type,
+                    standard,
+                    card_name,
+                    card,
+                })
             } else {
                 None
             }

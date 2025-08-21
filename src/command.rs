@@ -20,6 +20,8 @@ pub enum PcscCodecError {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum KeyType {
     Unknown(u8),
+    PicopassDebit,
+    PicopassCredit,
     MifareA,
     MifareB,
 }
@@ -27,6 +29,8 @@ pub enum KeyType {
 impl From<u8> for KeyType {
     fn from(value: u8) -> Self {
         match value {
+            0x00 => KeyType::PicopassDebit,
+            0x01 => KeyType::PicopassCredit,
             0x60 => KeyType::MifareA,
             0x61 => KeyType::MifareB,
             o => KeyType::Unknown(o),
@@ -38,6 +42,8 @@ impl From<KeyType> for u8 {
     fn from(value: KeyType) -> Self {
         match value {
             KeyType::Unknown(o) => o,
+            KeyType::PicopassDebit => 0x00,
+            KeyType::PicopassCredit => 0x01,
             KeyType::MifareA => 0x60,
             KeyType::MifareB => 0x61,
         }
@@ -58,6 +64,9 @@ pub enum PcscInstruction {
         key_id: u8,
     },
     Verify {
+        data: Vec<u8>,
+    },
+    ManageSession {
         data: Vec<u8>,
     },
     ReadBinary {
@@ -89,6 +98,7 @@ impl PcscCommand {
             PcscInstruction::LoadKeys { .. } => 0x82,
             PcscInstruction::GeneralAuthenticate { .. } => 0x86,
             PcscInstruction::Verify { .. } => 0x20,
+            PcscInstruction::ManageSession { .. } => 0xC2,
             PcscInstruction::ReadBinary { .. } => 0xB0,
             PcscInstruction::UpdateBinary { .. } => 0xD6,
         }
@@ -106,6 +116,7 @@ impl PcscCommand {
             PcscInstruction::LoadKeys { .. }
             | PcscInstruction::GeneralAuthenticate { .. }
             | PcscInstruction::Verify { .. }
+            | PcscInstruction::ManageSession { .. }
             | PcscInstruction::UpdateBinary { .. } => 2,
         }
     }
@@ -165,6 +176,16 @@ impl TryFrom<&[u8]> for PcscCommand {
                     data: value[5..eod].to_vec(),
                 }
             }
+            0xC2 => {
+                let lc = value[4];
+                let eod = 5 + (lc as usize);
+                if value.len() < eod {
+                    return Err(PcscCodecError::TooShort);
+                }
+                PcscInstruction::ManageSession {
+                    data: value[5..eod].to_vec(),
+                }
+            }
             0xB0 => PcscInstruction::ReadBinary { le: value[4] },
             0xD6 => {
                 let lc = value[4];
@@ -193,6 +214,7 @@ impl TryFrom<PcscCommand> for Vec<u8> {
             }
             PcscInstruction::LoadKeys { data }
             | PcscInstruction::Verify { data }
+            | PcscInstruction::ManageSession { data }
             | PcscInstruction::UpdateBinary { data } => {
                 let lc = data.len();
                 if lc > u8::MAX as usize {
