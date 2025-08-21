@@ -1,7 +1,10 @@
 [package]
 name = "nfc-pcsc"
 version = "0.1.0"
+authors = ["roastveg <louis@hamptonsoftworks.com>"]
 edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/RoastVeg/nfc-pcsc"
 
 [dependencies]
 pcsc = "2.8.2"
